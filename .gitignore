@@ -1,0 +1,3 @@
+/target
+.env
+google_application_credentials.json
