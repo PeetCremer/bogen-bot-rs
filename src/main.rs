@@ -1,10 +1,17 @@
 extern crate google_sheets4 as sheets4;
+use std::collections::HashSet;
+
+use serenity::framework::standard::Args;
+use serenity::framework::standard::CommandGroup;
+use serenity::framework::standard::HelpOptions;
+use serenity::framework::standard::help_commands;
+use serenity::model::prelude::UserId;
 use sheets4::{hyper, hyper_rustls, oauth2, Sheets};
 
 use serenity::async_trait;
 use serenity::prelude::*;
 use serenity::model::channel::Message;
-use serenity::framework::standard::macros::{command, group};
+use serenity::framework::standard::macros::{command, group, hook, help};
 use serenity::framework::standard::{StandardFramework, CommandResult};
 use serenity::model::gateway::{GatewayIntents, Ready};
 
@@ -39,10 +46,45 @@ impl EventHandler for Handler {
 #[commands(ping)]
 struct General;
 
+#[hook]
+async fn unknown_command(ctx: &Context, msg: &Message, unknown_command_name: &str) {
+    msg.reply(ctx, format!("Unknown command '{}'", unknown_command_name)).await.ok();
+}
+
 #[command]
+#[description = "Can be used to play ping-pong"]
 async fn ping(ctx: &Context, msg: &Message) -> CommandResult {
     msg.reply(ctx, "Pong!").await?;
 
+    Ok(())
+}
+
+// The framework provides two built-in help commands for you to use.
+// But you can also make your own customized help command that forwards
+// to the behaviour of either of them.
+#[help]
+// Define the maximum Levenshtein-distance between a searched command-name
+// and commands. If the distance is lower than or equal the set distance,
+// it will be displayed as a suggestion.
+// Setting the distance to 0 will disable suggestions.
+#[max_levenshtein_distance(3)]
+// When you use sub-groups, Serenity will use the `indention_prefix` to indicate
+// how deeply an item is indented.
+// The default value is "-", it will be changed to "+".
+#[indention_prefix = "+"]
+// Serenity will automatically analyse and generate a hint/tip explaining the possible
+// cases of ~~strikethrough-commands~~, but only if
+// `strikethrough_commands_tip_in_{dm, guild}` aren't specified.
+// If you pass in a value, it will be displayed instead.
+async fn my_help(
+    context: &Context,
+    msg: &Message,
+    args: Args,
+    help_options: &'static HelpOptions,
+    groups: &[&'static CommandGroup],
+    owners: HashSet<UserId>,
+) -> CommandResult {
+    let _ = help_commands::with_embeds(context, msg, args, help_options, groups, owners).await;
     Ok(())
 }
 
@@ -86,6 +128,8 @@ async fn main() {
     // Set up serenity bot
     let framework = StandardFramework::new()
     .configure(|c| c.prefix("~")) // set the bot's prefix to "~"
+    .unrecognised_command(unknown_command)
+    .help(&MY_HELP)
     .group(&GENERAL_GROUP);
 
     let intents = GatewayIntents::non_privileged() | GatewayIntents::MESSAGE_CONTENT;
