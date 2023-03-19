@@ -89,6 +89,7 @@ version = "0.1.0"
 dependencies = [
  "dotenv",
  "google-sheets4",
+ "once_cell",
  "serenity",
  "tokio",
 ]
