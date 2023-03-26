@@ -3,6 +3,8 @@ mod get_ability_value;
 extern crate google_sheets4 as sheets4;
 use std::collections::HashSet;
 
+use rand::Rng;
+
 use serenity::framework::standard::help_commands;
 use serenity::framework::standard::Args;
 use serenity::framework::standard::CommandGroup;
@@ -74,21 +76,10 @@ async fn check_character(ctx: &Context, msg: &Message, mut args: Args) -> Comman
         }
     };
 
-    let ability = match args.single_quoted::<String>() {
-        Ok(ability) => ability,
-        Err(_) => {
-            msg.reply(ctx, "Please specify an ability as the second argument")
-                .await?;
-            return Ok(());
-        }
-    };
-
     let spreadsheet_id = &CONFIG.get().unwrap().character_spreadsheet_id;
 
     let sheets_api = SHEETS.get().unwrap();
-    // character_name must be in the sheets
-    // TODO does the below give the minimum sheet?
-    // TODO is th below even required or can we just check the ability immediately?
+    // character_name must match one of the sheets
     let (_, spreadsheet) = sheets_api
         .spreadsheets()
         .get(spreadsheet_id)
@@ -116,9 +107,40 @@ async fn check_character(ctx: &Context, msg: &Message, mut args: Args) -> Comman
         return Ok(());
     }
 
-    let (name, value) =
-        match get_ability_value(sheets_api, spreadsheet_id, &character_name, &ability).await {
-            Ok(res) => res,
+    let first_ability = match args.single_quoted::<String>() {
+        Ok(ability) => ability,
+        Err(_) => {
+            msg.reply(ctx, "Please specify an ability to roll").await?;
+            return Ok(());
+        }
+    };
+
+    let second_ability = match args.single_quoted::<String>() {
+        Ok(delimiter) => {
+            let second_ability = args.single_quoted::<String>().ok();
+            if delimiter != "+" || second_ability.is_none() {
+                msg.reply(ctx, "Please specify a second ability to roll in the format: 'first ability' + 'second ability'")
+                .await?;
+                return Ok(());
+            }
+            second_ability
+        }
+        Err(_) => None,
+    };
+
+    // get full ability names and ability values from spreadsheets
+    let mut ability_value_pairs: [Option<(String, u8)>; 2] = [None, None];
+    for (ability, pair) in [Some(first_ability), second_ability]
+        .iter()
+        .zip(ability_value_pairs.iter_mut())
+    {
+        let ability = match ability {
+            Some(ability) => ability,
+            None => break,
+        };
+        *pair = match get_ability_value(sheets_api, spreadsheet_id, &character_name, ability).await
+        {
+            Ok(res) => Some(res),
             Err(err) => {
                 msg.reply(
                     ctx,
@@ -128,9 +150,42 @@ async fn check_character(ctx: &Context, msg: &Message, mut args: Args) -> Comman
                 return Ok(());
             }
         };
+    }
 
-    msg.reply(ctx, format!("Rolling {} with value {}", name, value))
-        .await?;
+    // rolll
+    let mut rng: rand::rngs::StdRng = rand::SeedableRng::from_entropy();
+    let dist: rand::distributions::Uniform<u8> =
+        rand::distributions::Uniform::<u8>::new_inclusive(1, 4);
+    let pos_roll = rng.sample(dist);
+    let neg_roll = rng.sample(dist);
+    let (first_ability, second_ability) = (
+        ability_value_pairs[0].as_ref().unwrap(),
+        &ability_value_pairs[1],
+    );
+    let expression = match second_ability {
+        Some(second_ability) => format!(
+            "**{}** rolls **{}**({}) + **{}**({}) + d4({}) - d4({}) = **{}**",
+            character_name,
+            first_ability.0,
+            first_ability.1,
+            second_ability.0,
+            second_ability.1,
+            pos_roll,
+            neg_roll,
+            first_ability.1 + second_ability.1 + pos_roll - neg_roll
+        ),
+        None => format!(
+            "**{}** rolls **{}**(2x{}) + d4({}) - d4({}) = **{}**",
+            character_name,
+            first_ability.0,
+            first_ability.1,
+            pos_roll,
+            neg_roll,
+            2 * first_ability.1 + pos_roll - neg_roll
+        ),
+    };
+
+    msg.reply(ctx, expression).await?;
     Ok(())
 }
 

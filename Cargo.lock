@@ -91,6 +91,7 @@ dependencies = [
  "dotenv",
  "google-sheets4",
  "once_cell",
+ "rand",
  "serde_json",
  "serenity",
  "tokio",
