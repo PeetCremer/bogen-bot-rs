@@ -53,7 +53,7 @@ impl EventHandler for Handler {
 }
 
 #[group]
-#[commands(ping, check_character)]
+#[commands(check_character)]
 struct General;
 
 #[hook]
@@ -62,15 +62,6 @@ async fn unknown_command(ctx: &Context, msg: &Message, unknown_command_name: &st
         .await
         .ok();
 }
-
-#[command]
-#[description = "Can be used to play ping-pong"]
-async fn ping(ctx: &Context, msg: &Message) -> CommandResult {
-    msg.reply(ctx, "Pong!").await?;
-
-    Ok(())
-}
-
 #[command]
 #[description = "Roll a value on the character sheet of a given character"]
 async fn check_character(ctx: &Context, msg: &Message, mut args: Args) -> CommandResult {
@@ -126,11 +117,14 @@ async fn check_character(ctx: &Context, msg: &Message, mut args: Args) -> Comman
     }
 
     let (name, value) =
-        match get_ability_value(sheets_api, &[], spreadsheet_id, &character_name, &ability).await {
+        match get_ability_value(sheets_api, spreadsheet_id, &character_name, &ability).await {
             Ok(res) => res,
             Err(err) => {
-                msg.reply(ctx, format!("ERROR finding ability: {}", err))
-                    .await?;
+                msg.reply(
+                    ctx,
+                    format!("ERROR fetching value for ability {}: {}", &ability, err),
+                )
+                .await?;
                 return Ok(());
             }
         };

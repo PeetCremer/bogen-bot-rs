@@ -3,9 +3,9 @@ extern crate google_sheets4 as sheets4;
 use std::fmt::{self, Display};
 
 use sheets4::client::DefaultDelegate;
-use sheets4::{client, hyper, Delegate, Sheets};
+use sheets4::{api, client, hyper, Delegate, Sheets};
 
-use crate::hyper::Uri;
+use hyper::Uri;
 use std::error::Error as StdError;
 use tokio::io::{AsyncRead, AsyncWrite};
 
@@ -48,7 +48,6 @@ use hyper::header::{AUTHORIZATION, USER_AGENT};
 
 pub async fn get_ability_value<S>(
     hub: &Sheets<S>,
-    scopes: &[String],
     spreadsheet_id: &str,
     character_name: &str,
     ability: &str,
@@ -61,10 +60,9 @@ where
     S::Error: Into<Box<dyn StdError + Send + Sync>>,
 {
     const LIMIT: usize = 3;
-    let csv_string =
-        get_ability_value_csv(hub, scopes, spreadsheet_id, character_name, ability, LIMIT)
-            .await
-            .map_err(Error::ClientError)?;
+    let csv_string = get_ability_value_csv(hub, spreadsheet_id, character_name, ability, LIMIT)
+        .await
+        .map_err(Error::ClientError)?;
 
     let mut reader = csv::ReaderBuilder::new()
         .has_headers(false)
@@ -97,7 +95,6 @@ where
 
 async fn get_ability_value_csv<S>(
     hub: &Sheets<S>,
-    scopes: &[String],
     spreadsheet_id: &str,
     character_name: &str,
     ability: &str,
@@ -112,8 +109,17 @@ where
 {
     let uri: String = format!("https://docs.google.com/spreadsheets/d/{}/gviz/tq?tq=select+A+,+G+where+lower(A)+starts+with+'{}'+limit+{}&sheet={}&tqx=out:csv", spreadsheet_id, ability.to_lowercase(), &limit, character_name);
     let mut dlg = DefaultDelegate;
+    dlg.begin(client::MethodInfo {
+        id: "sheets.spreadsheets.get",
+        http_method: hyper::Method::GET,
+    });
+
     loop {
-        let token = match hub.auth.token(scopes).await {
+        let token = match hub
+            .auth
+            .token(&[api::Scope::DriveReadonly.as_ref().to_string()])
+            .await
+        {
             Ok(token) => token.clone(),
             Err(err) => match dlg.token(&err) {
                 Some(token) => token,
