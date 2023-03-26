@@ -1,3 +1,5 @@
+mod get_ability_value;
+
 extern crate google_sheets4 as sheets4;
 use std::collections::HashSet;
 
@@ -16,6 +18,8 @@ use serenity::framework::standard::{CommandResult, StandardFramework};
 use serenity::model::channel::Message;
 use serenity::model::gateway::{GatewayIntents, Ready};
 use serenity::prelude::*;
+
+use crate::get_ability_value::get_ability_value;
 
 use once_cell::sync::OnceCell;
 
@@ -78,41 +82,61 @@ async fn check_character(ctx: &Context, msg: &Message, mut args: Args) -> Comman
             return Ok(());
         }
     };
-    msg.reply(
-        ctx,
-        format!("Not implemented to roll for '{}' yet!", character_name),
-    )
-    .await?;
+
+    let ability = match args.single_quoted::<String>() {
+        Ok(ability) => ability,
+        Err(_) => {
+            msg.reply(ctx, "Please specify an ability as the second argument")
+                .await?;
+            return Ok(());
+        }
+    };
+
+    let spreadsheet_id = &CONFIG.get().unwrap().character_spreadsheet_id;
 
     let sheets_api = SHEETS.get().unwrap();
-    // TODO does the below return the minimum sheet?
-    let (_, sheet_titles) = sheets_api
+    // character_name must be in the sheets
+    // TODO does the below give the minimum sheet?
+    // TODO is th below even required or can we just check the ability immediately?
+    let (_, spreadsheet) = sheets_api
         .spreadsheets()
-        .get(&CONFIG.get().unwrap().character_spreadsheet_id)
+        .get(spreadsheet_id)
         .param("fields", "sheets.properties.title")
         .doit()
         .await
         .expect("Unable to fetch sheet");
-    let sheet_titles: Vec<String> = match &sheet_titles.sheets {
-        Some(sheets) => sheets
-            .iter()
-            .map(|s| {
-                s.properties
-                    .as_ref()
-                    .unwrap()
-                    .title
-                    .as_ref()
-                    .unwrap()
-                    .clone()
-            })
-            .collect(),
-        None => {
-            msg.reply(ctx, "Error: No sheets available!").await?;
-            return Ok(());
-        }
-    };
-    dbg!(sheet_titles);
 
+    if match &spreadsheet.sheets {
+        Some(sheets) => !sheets
+            .iter()
+            .filter_map(|s| s.properties.as_ref())
+            .filter_map(|p| p.title.as_ref())
+            .any(|t| t == &character_name),
+        None => true,
+    } {
+        msg.reply(
+            ctx,
+            format!(
+                "ERROR: character name '{}' does not correspond to a valid sheet in spreadsheet!",
+                character_name
+            ),
+        )
+        .await?;
+        return Ok(());
+    }
+
+    let (name, value) =
+        match get_ability_value(sheets_api, &[], spreadsheet_id, &character_name, &ability).await {
+            Ok(res) => res,
+            Err(err) => {
+                msg.reply(ctx, format!("ERROR finding ability: {}", err))
+                    .await?;
+                return Ok(());
+            }
+        };
+
+    msg.reply(ctx, format!("Rolling {} with value {}", name, value))
+        .await?;
     Ok(())
 }
 
@@ -161,8 +185,8 @@ async fn main() {
         .await
         .expect("Failed to create authenticator");
 
-    let hub = SHEETS.get_or_init(|| {
-        Sheets::new(
+    SHEETS
+        .set(Sheets::new(
             hyper::Client::builder().build(
                 hyper_rustls::HttpsConnectorBuilder::new()
                     .with_native_roots()
@@ -172,16 +196,8 @@ async fn main() {
                     .build(),
             ),
             auth,
-        )
-    });
-
-    let result = hub
-        .spreadsheets()
-        .get(&config.character_spreadsheet_id)
-        .doit()
-        .await
-        .expect("Unable to fetch sheet");
-    dbg!(result.0);
+        ))
+        .ok();
 
     // Set up serenity bot
     let framework = StandardFramework::new()
