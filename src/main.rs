@@ -1,3 +1,4 @@
+mod db;
 mod get_ability_value;
 
 extern crate google_sheets4 as sheets4;
@@ -21,6 +22,7 @@ use serenity::model::channel::Message;
 use serenity::model::gateway::{GatewayIntents, Ready};
 use serenity::prelude::*;
 
+use crate::db::SheetDB;
 use crate::get_ability_value::get_ability_value;
 
 use once_cell::sync::OnceCell;
@@ -43,8 +45,11 @@ impl Config {
     }
 }
 
+type SheetsAPI = Sheets<HttpsConnector<HttpConnector>>;
+
 static CONFIG: OnceCell<Config> = OnceCell::new();
-static SHEETS: OnceCell<Sheets<HttpsConnector<HttpConnector>>> = OnceCell::new();
+static SHEETS: OnceCell<SheetsAPI> = OnceCell::new();
+static mut SHEET_DB: OnceCell<SheetDB> = OnceCell::new();
 
 struct Handler;
 #[async_trait]
@@ -55,7 +60,7 @@ impl EventHandler for Handler {
 }
 
 #[group]
-#[commands(check_character)]
+#[commands(check_character, claim, my_character, check)]
 struct General;
 
 #[hook]
@@ -64,9 +69,10 @@ async fn unknown_command(ctx: &Context, msg: &Message, unknown_command_name: &st
         .await
         .ok();
 }
+
 #[command]
-#[description = "Roll a value on the character sheet of a given character"]
-async fn check_character(ctx: &Context, msg: &Message, mut args: Args) -> CommandResult {
+#[description = "Claim a character sheet"]
+async fn claim(ctx: &Context, msg: &Message, mut args: Args) -> CommandResult {
     let character_name = match args.single_quoted::<String>() {
         Ok(character_name) => character_name,
         Err(_) => {
@@ -76,10 +82,75 @@ async fn check_character(ctx: &Context, msg: &Message, mut args: Args) -> Comman
         }
     };
 
+    let sheets_api = SHEETS.get().unwrap();
     let spreadsheet_id = &CONFIG.get().unwrap().character_spreadsheet_id;
 
-    let sheets_api = SHEETS.get().unwrap();
-    // character_name must match one of the sheets
+    match assert_character_name(sheets_api, spreadsheet_id, &character_name).await {
+        Ok(()) => {}
+        Err(m) => {
+            msg.reply(ctx, m).await?;
+            return Ok(());
+        }
+    }
+
+    let guild_id: u64 = match msg.guild_id {
+        Some(guild_id) => guild_id.into(),
+        None => {
+            msg.reply(ctx, "Command can only be called from a guild channel")
+                .await?;
+            return Ok(());
+        }
+    };
+
+    let sheet_db = unsafe { SHEET_DB.get_mut() }.unwrap();
+
+    match sheet_db.store_sheet(guild_id, msg.author.id.into(), &character_name) {
+        Ok(()) => {
+            msg.reply(ctx, format!("Claimed sheet {}", character_name))
+                .await?
+        }
+        Err(_) => {
+            msg.reply(ctx, format!("Failed claiming sheet {}", character_name))
+                .await?
+        }
+    };
+    Ok(())
+}
+
+async fn my_character_impl(msg: &Message) -> Result<String, String> {
+    let guild_id: u64 = match msg.guild_id {
+        Some(guild_id) => guild_id.into(),
+        None => {
+            return Err("Command can only be called from a guild channel".to_owned());
+        }
+    };
+
+    let sheet_db = unsafe { SHEET_DB.get_mut() }.unwrap();
+
+    match sheet_db.get_sheet(guild_id, msg.author.id.into()) {
+        Ok(name) => name.ok_or("You have not claimed a character yet!".to_owned()),
+        Err(err) => Err(format!("Failed fetching your character: {}", err)),
+    }
+}
+
+#[command]
+#[description = "Show which character is yours"]
+async fn my_character(ctx: &Context, msg: &Message, mut _args: Args) -> CommandResult {
+    match my_character_impl(msg).await {
+        Ok(name) => {
+            msg.reply(ctx, format!("Your claimed character is {}", name))
+                .await?
+        }
+        Err(err) => msg.reply(ctx, err).await?,
+    };
+    Ok(())
+}
+
+async fn assert_character_name(
+    sheets_api: &SheetsAPI,
+    spreadsheet_id: &str,
+    character_name: &str,
+) -> Result<(), String> {
     let (_, spreadsheet) = sheets_api
         .spreadsheets()
         .get(spreadsheet_id)
@@ -93,18 +164,34 @@ async fn check_character(ctx: &Context, msg: &Message, mut args: Args) -> Comman
             .iter()
             .filter_map(|s| s.properties.as_ref())
             .filter_map(|p| p.title.as_ref())
-            .any(|t| t == &character_name),
+            .any(|t| t == character_name),
         None => true,
     } {
-        msg.reply(
-            ctx,
-            format!(
-                "ERROR: character name '{}' does not correspond to a valid sheet in spreadsheet!",
-                character_name
-            ),
-        )
-        .await?;
-        return Ok(());
+        Err(format!(
+            "ERROR: character name '{}' does not correspond to a valid sheet in spreadsheet!",
+            character_name
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+async fn check_impl(
+    ctx: &Context,
+    msg: &Message,
+    mut args: Args,
+    character_name: &str,
+) -> CommandResult {
+    let spreadsheet_id = &CONFIG.get().unwrap().character_spreadsheet_id;
+
+    let sheets_api = SHEETS.get().unwrap();
+
+    match assert_character_name(sheets_api, spreadsheet_id, character_name).await {
+        Ok(()) => {}
+        Err(m) => {
+            msg.reply(ctx, m).await?;
+            return Ok(());
+        }
     }
 
     let first_ability = match args.single_quoted::<String>() {
@@ -138,8 +225,7 @@ async fn check_character(ctx: &Context, msg: &Message, mut args: Args) -> Comman
             Some(ability) => ability,
             None => break,
         };
-        *pair = match get_ability_value(sheets_api, spreadsheet_id, &character_name, ability).await
-        {
+        *pair = match get_ability_value(sheets_api, spreadsheet_id, character_name, ability).await {
             Ok(res) => Some(res),
             Err(err) => {
                 msg.reply(
@@ -152,7 +238,7 @@ async fn check_character(ctx: &Context, msg: &Message, mut args: Args) -> Comman
         };
     }
 
-    // rolll
+    // roll
     let mut rng: rand::rngs::StdRng = rand::SeedableRng::from_entropy();
     let dist: rand::distributions::Uniform<u8> =
         rand::distributions::Uniform::<u8>::new_inclusive(1, 4);
@@ -187,6 +273,33 @@ async fn check_character(ctx: &Context, msg: &Message, mut args: Args) -> Comman
 
     msg.reply(ctx, expression).await?;
     Ok(())
+}
+
+#[command]
+#[description = "Roll a value on the character sheet of a given character"]
+async fn check_character(ctx: &Context, msg: &Message, mut args: Args) -> CommandResult {
+    let character_name = match args.single_quoted::<String>() {
+        Ok(character_name) => character_name,
+        Err(_) => {
+            msg.reply(ctx, "Please specify a character name as the first argument")
+                .await?;
+            return Ok(());
+        }
+    };
+
+    check_impl(ctx, msg, args, &character_name).await
+}
+
+#[command]
+#[description = "Roll a value for your claimed character"]
+async fn check(ctx: &Context, msg: &Message, args: Args) -> CommandResult {
+    match my_character_impl(msg).await {
+        Ok(name) => check_impl(ctx, msg, args, &name).await,
+        Err(err) => {
+            msg.reply(ctx, err).await?;
+            Ok(())
+        }
+    }
 }
 
 // The framework provides two built-in help commands for you to use.
@@ -247,6 +360,10 @@ async fn main() {
             auth,
         ))
         .ok();
+
+    // Set up DB to store sheet mappings
+    let sheet_db = SheetDB::open().expect("Failed to open DB");
+    unsafe { SHEET_DB.set(sheet_db) }.ok();
 
     // Set up serenity bot
     let framework = StandardFramework::new()
