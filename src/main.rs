@@ -367,7 +367,7 @@ async fn main() {
 
     // Set up serenity bot
     let framework = StandardFramework::new()
-        .configure(|c| c.prefix("~")) // set the bot's prefix to "~"
+        .configure(|c| c.prefix("!")) // set the bot's prefix to "~"
         .unrecognised_command(unknown_command)
         .help(&MY_HELP)
         .group(&GENERAL_GROUP);
