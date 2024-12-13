@@ -6,6 +6,9 @@ use std::collections::HashSet;
 
 use rand::Rng;
 
+use pyo3::prelude::*;
+use pyo3::ffi::c_str;
+
 use serenity::framework::standard::help_commands;
 use serenity::framework::standard::Args;
 use serenity::framework::standard::CommandGroup;
@@ -60,7 +63,7 @@ impl EventHandler for Handler {
 }
 
 #[group]
-#[commands(check_character, claim, my_character, check)]
+#[commands(check_character, claim, my_character, check, completion)]
 struct General;
 
 #[hook]
@@ -291,6 +294,36 @@ async fn check_character(ctx: &Context, msg: &Message, mut args: Args) -> Comman
 }
 
 #[command]
+#[description = "Run a chat completion"]
+async fn completion(ctx: &Context, msg: &Message, mut _args: Args) -> CommandResult {
+    let py_app = c_str!(include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"), "/python/main.py"
+    )));
+    let from_python = Python::with_gil(|py| -> PyResult<Py<PyAny>> {
+        let sys = py.import("sys")?;
+        let path = sys.getattr("path")?;
+        path.call_method1("append", (".venv/lib/python3.12/site-packages",))?;  // append my venv path
+        let app: Py<PyAny> = PyModule::from_code(py, py_app, c_str!(""), c_str!(""))?
+        
+            .getattr("run")?
+            .into();
+        app.call0(py)
+    });
+    let res = match from_python {
+        Ok(res) => {res.to_string()},
+        Err(err) => {
+            let err_str = err.to_string();
+            println!("Error: {}", err_str);
+            msg.reply(ctx, format!("Internal Error")).await?;
+            return Ok(());
+        }
+    };
+
+    msg.reply(ctx, &res).await?;
+    Ok(())
+}
+
+#[command]
 #[description = "Roll a value for your claimed character"]
 async fn check(ctx: &Context, msg: &Message, args: Args) -> CommandResult {
     match my_character_impl(msg).await {
@@ -333,6 +366,9 @@ async fn my_help(
 
 #[tokio::main]
 async fn main() {
+    // Prepare python interpreter for python calls
+    pyo3::prepare_freethreaded_python();
+
     // Load configuration from env, failing if if it is incomplete
     let config = CONFIG.get_or_init(Config::load);
 
