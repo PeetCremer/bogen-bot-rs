@@ -2,26 +2,20 @@ mod db;
 mod get_ability_value;
 
 extern crate google_sheets4 as sheets4;
-use std::collections::HashSet;
 
 use rand::Rng;
 
 use pyo3::prelude::*;
 use pyo3::ffi::c_str;
 
-use serenity::framework::standard::help_commands;
-use serenity::framework::standard::Args;
-use serenity::framework::standard::CommandGroup;
-use serenity::framework::standard::HelpOptions;
-use serenity::model::prelude::UserId;
+use poise::serenity_prelude as serenity;
+
 use sheets4::hyper::client::HttpConnector;
 use sheets4::hyper_rustls::HttpsConnector;
 use sheets4::{hyper, hyper_rustls, oauth2, Sheets};
 
 use serenity::async_trait;
-use serenity::framework::standard::macros::{command, group, help, hook};
-use serenity::framework::standard::{CommandResult, StandardFramework};
-use serenity::model::channel::Message;
+
 use serenity::model::gateway::{GatewayIntents, Ready};
 use serenity::prelude::*;
 
@@ -29,6 +23,10 @@ use crate::db::SheetDB;
 use crate::get_ability_value::get_ability_value;
 
 use once_cell::sync::OnceCell;
+
+struct Data {} // User data, which is stored and accessible in all command invocations
+type Error = Box<dyn std::error::Error + Send + Sync>;
+type PoiseContext<'a> = poise::Context<'a, Data, Error>;
 
 #[derive(Debug)]
 struct Config {
@@ -62,25 +60,16 @@ impl EventHandler for Handler {
     }
 }
 
-#[group]
-#[commands(check_character, claim, my_character, check, completion)]
-struct General;
-
-#[hook]
-async fn unknown_command(ctx: &Context, msg: &Message, unknown_command_name: &str) {
-    msg.reply(ctx, format!("Unknown command '{}'", unknown_command_name))
-        .await
-        .ok();
-}
-
-#[command]
-#[description = "Claim a character sheet"]
-async fn claim(ctx: &Context, msg: &Message, mut args: Args) -> CommandResult {
-    let character_name = match args.single_quoted::<String>() {
-        Ok(character_name) => character_name,
-        Err(_) => {
-            msg.reply(ctx, "Please specify a character name as the first argument")
-                .await?;
+/// Claim a character sheet
+#[poise::command(prefix_command, slash_command, guild_only)]
+async fn claim(
+    ctx: PoiseContext<'_>,
+    #[description = "Character you want to claim"] character_name: Option<String>,
+) -> Result<(), Error> {
+    let character_name = match character_name {
+        Some(character_name) => character_name,
+        None => {
+            ctx.say("Please specify a character name as the first argument").await?;
             return Ok(());
         }
     };
@@ -91,60 +80,46 @@ async fn claim(ctx: &Context, msg: &Message, mut args: Args) -> CommandResult {
     match assert_character_name(sheets_api, spreadsheet_id, &character_name).await {
         Ok(()) => {}
         Err(m) => {
-            msg.reply(ctx, m).await?;
+            ctx.say(m).await?;
             return Ok(());
         }
     }
 
-    let guild_id: u64 = match msg.guild_id {
-        Some(guild_id) => guild_id.into(),
-        None => {
-            msg.reply(ctx, "Command can only be called from a guild channel")
-                .await?;
-            return Ok(());
-        }
-    };
-
+    let guild_id = ctx.guild_id().unwrap();
     let sheet_db = unsafe { SHEET_DB.get_mut() }.unwrap();
 
-    match sheet_db.store_sheet(guild_id, msg.author.id.into(), &character_name) {
+    match sheet_db.store_sheet(guild_id.into(), ctx.author().id.into(), &character_name) {
         Ok(()) => {
-            msg.reply(ctx, format!("Claimed sheet {}", character_name))
+            ctx.say(format!("Claimed sheet {}", character_name))
                 .await?
         }
         Err(_) => {
-            msg.reply(ctx, format!("Failed claiming sheet {}", character_name))
+            ctx.say(format!("Failed claiming sheet {}", character_name))
                 .await?
         }
     };
     Ok(())
 }
 
-async fn my_character_impl(msg: &Message) -> Result<String, String> {
-    let guild_id: u64 = match msg.guild_id {
-        Some(guild_id) => guild_id.into(),
-        None => {
-            return Err("Command can only be called from a guild channel".to_owned());
-        }
-    };
-
+/// Check which character you have claimed
+async fn my_character_impl(ctx: &PoiseContext<'_>) -> Result<String, String> {
+    let guild_id = ctx.guild_id().unwrap();
+    let author_id = ctx.author().id;
     let sheet_db = unsafe { SHEET_DB.get_mut() }.unwrap();
 
-    match sheet_db.get_sheet(guild_id, msg.author.id.into()) {
+    match sheet_db.get_sheet(guild_id.into(), author_id.into()) {
         Ok(name) => name.ok_or("You have not claimed a character yet!".to_owned()),
         Err(err) => Err(format!("Failed fetching your character: {}", err)),
     }
 }
 
-#[command]
-#[description = "Show which character is yours"]
-async fn my_character(ctx: &Context, msg: &Message, mut _args: Args) -> CommandResult {
-    match my_character_impl(msg).await {
+#[poise::command(prefix_command, slash_command, guild_only)]
+async fn my_character(ctx: PoiseContext<'_>) -> Result<(), Error> {
+    match my_character_impl(&ctx).await {
         Ok(name) => {
-            msg.reply(ctx, format!("Your claimed character is {}", name))
-                .await?
+            ctx.say(format!("Your claimed character is {}", name)).await?
         }
-        Err(err) => msg.reply(ctx, err).await?,
+        Err(err) => ctx.say(err).await?,
     };
     Ok(())
 }
@@ -179,12 +154,14 @@ async fn assert_character_name(
     }
 }
 
+
+
 async fn check_impl(
-    ctx: &Context,
-    msg: &Message,
-    mut args: Args,
+    ctx: &PoiseContext<'_>,
     character_name: &str,
-) -> CommandResult {
+    first_ability: &str,
+    second_ability: Option<&str>,
+) -> Result<(), Error> {
     let spreadsheet_id = &CONFIG.get().unwrap().character_spreadsheet_id;
 
     let sheets_api = SHEETS.get().unwrap();
@@ -192,31 +169,10 @@ async fn check_impl(
     match assert_character_name(sheets_api, spreadsheet_id, character_name).await {
         Ok(()) => {}
         Err(m) => {
-            msg.reply(ctx, m).await?;
+            ctx.say(m).await?;
             return Ok(());
         }
     }
-
-    let first_ability = match args.single_quoted::<String>() {
-        Ok(ability) => ability,
-        Err(_) => {
-            msg.reply(ctx, "Please specify an ability to roll").await?;
-            return Ok(());
-        }
-    };
-
-    let second_ability = match args.single_quoted::<String>() {
-        Ok(delimiter) => {
-            let second_ability = args.single_quoted::<String>().ok();
-            if delimiter != "+" || second_ability.is_none() {
-                msg.reply(ctx, "Please specify a second ability to roll in the format: 'first ability' + 'second ability'")
-                .await?;
-                return Ok(());
-            }
-            second_ability
-        }
-        Err(_) => None,
-    };
 
     // get full ability names and ability values from spreadsheets
     let mut ability_value_pairs: [Option<(String, u8)>; 2] = [None, None];
@@ -231,8 +187,7 @@ async fn check_impl(
         *pair = match get_ability_value(sheets_api, spreadsheet_id, character_name, ability).await {
             Ok(res) => Some(res),
             Err(err) => {
-                msg.reply(
-                    ctx,
+                ctx.say(
                     format!("ERROR fetching value for ability {}: {}", &ability, err),
                 )
                 .await?;
@@ -274,28 +229,28 @@ async fn check_impl(
         ),
     };
 
-    msg.reply(ctx, expression).await?;
+    ctx.say(expression).await?;
     Ok(())
 }
 
-#[command]
-#[description = "Roll a value on the character sheet of a given character"]
-async fn check_character(ctx: &Context, msg: &Message, mut args: Args) -> CommandResult {
-    let character_name = match args.single_quoted::<String>() {
-        Ok(character_name) => character_name,
-        Err(_) => {
-            msg.reply(ctx, "Please specify a character name as the first argument")
-                .await?;
-            return Ok(());
-        }
-    };
 
-    check_impl(ctx, msg, args, &character_name).await
+/// Roll a value on the character sheet of a given character
+#[poise::command(prefix_command, slash_command, guild_only)]
+async fn check_character(
+    ctx: PoiseContext<'_>,
+    #[description = "Character you want to roll for"] character_name: String,
+    #[description = "First ability you want to roll"] first_ability: String,
+    #[description = "Second ability you want to roll"] second_ability: Option<String>,
+) -> Result<(), Error> {
+    check_impl(&ctx, &character_name, &first_ability, second_ability.as_ref().map(|x| x.as_str())).await
 }
 
-#[command]
-#[description = "Run a chat completion"]
-async fn completion(ctx: &Context, msg: &Message, mut _args: Args) -> CommandResult {
+/// Run a chat completion
+#[poise::command(prefix_command, slash_command, guild_only)]
+async fn completion(
+    ctx: PoiseContext<'_>,
+    #[description = "Message you want a completion on"] message: String,
+) -> Result<(), Error> {
     let py_app = c_str!(include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"), "/python/main.py"
     )));
@@ -307,60 +262,51 @@ async fn completion(ctx: &Context, msg: &Message, mut _args: Args) -> CommandRes
         
             .getattr("run")?
             .into();
-        app.call0(py)
+        app.call1(py, (message,))
     });
     let res = match from_python {
         Ok(res) => {res.to_string()},
         Err(err) => {
             let err_str = err.to_string();
             println!("Error: {}", err_str);
-            msg.reply(ctx, format!("Internal Error")).await?;
+            ctx.say("Internal Error").await?;
             return Ok(());
         }
     };
 
-    msg.reply(ctx, &res).await?;
+    ctx.say(&res).await?;
     Ok(())
 }
 
-#[command]
-#[description = "Roll a value for your claimed character"]
-async fn check(ctx: &Context, msg: &Message, args: Args) -> CommandResult {
-    match my_character_impl(msg).await {
-        Ok(name) => check_impl(ctx, msg, args, &name).await,
+/// Roll a value for your claimed character
+#[poise::command(prefix_command, slash_command, guild_only)]
+async fn check(
+    ctx: PoiseContext<'_>,
+    #[description = "First ability you want to roll"] first_ability: String,
+    #[description = "Second ability you want to roll"] second_ability: Option<String>,
+) -> Result<(), Error> {
+    match my_character_impl(&ctx).await {
+        Ok(name) => check_impl(&ctx, &name, &first_ability, second_ability.as_ref().map(|x| x.as_str())).await,
         Err(err) => {
-            msg.reply(ctx, err).await?;
+            ctx.say(err).await?;
             Ok(())
         }
     }
 }
 
-// The framework provides two built-in help commands for you to use.
-// But you can also make your own customized help command that forwards
-// to the behaviour of either of them.
-#[help]
-// Define the maximum Levenshtein-distance between a searched command-name
-// and commands. If the distance is lower than or equal the set distance,
-// it will be displayed as a suggestion.
-// Setting the distance to 0 will disable suggestions.
-#[max_levenshtein_distance(3)]
-// When you use sub-groups, Serenity will use the `indention_prefix` to indicate
-// how deeply an item is indented.
-// The default value is "-", it will be changed to "+".
-#[indention_prefix = "+"]
-// Serenity will automatically analyse and generate a hint/tip explaining the possible
-// cases of ~~strikethrough-commands~~, but only if
-// `strikethrough_commands_tip_in_{dm, guild}` aren't specified.
-// If you pass in a value, it will be displayed instead.
-async fn my_help(
-    context: &Context,
-    msg: &Message,
-    args: Args,
-    help_options: &'static HelpOptions,
-    groups: &[&'static CommandGroup],
-    owners: HashSet<UserId>,
-) -> CommandResult {
-    let _ = help_commands::with_embeds(context, msg, args, help_options, groups, owners).await;
+/// Show this menu
+#[poise::command(prefix_command, track_edits, slash_command)]
+pub async fn help(
+    ctx: PoiseContext<'_>,
+    #[description = "Specific command to show help about"] command: Option<String>,
+) -> Result<(), Error> {
+    let config = poise::builtins::HelpConfiguration {
+        extra_text_at_bottom: "\
+Type ?help command for more info on a command.
+You can edit your message to the bot and the bot will edit its response.",
+        ..Default::default()
+    };
+    poise::builtins::help(ctx, command.as_deref(), config).await?;
     Ok(())
 }
 
@@ -402,11 +348,23 @@ async fn main() {
     unsafe { SHEET_DB.set(sheet_db) }.ok();
 
     // Set up serenity bot
-    let framework = StandardFramework::new()
-        .configure(|c| c.prefix("!")) // set the bot's prefix to "~"
-        .unrecognised_command(unknown_command)
-        .help(&MY_HELP)
-        .group(&GENERAL_GROUP);
+    let framework = poise::Framework::builder()
+        .options(poise::FrameworkOptions {
+            prefix_options: poise::PrefixFrameworkOptions {
+                prefix: Some("!".into()),
+                case_insensitive_commands: true,
+                ..Default::default()
+            },
+            commands: vec![claim(), my_character(), check(), check_character(), completion(), help()],
+            ..Default::default()
+        })
+        .setup(|ctx, _ready, framework| {
+            Box::pin(async move {
+                poise::builtins::register_globally(ctx, &framework.options().commands).await?;
+                Ok(Data {})
+            })
+        })
+        .build();
 
     let intents = GatewayIntents::non_privileged() | GatewayIntents::MESSAGE_CONTENT;
     let mut client = Client::builder(&config.discord_bot_token, intents)

@@ -5,6 +5,14 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "langchain-openai>=0.2.12",
     "langchain>=0.3.11",
-    "numpy>=2.2.0",
+    "python-dotenv>=1.0.1",
+    "langchain-xai>=0.1.0",
+]
+
+[dependency-groups]
+dev = [
+    "mypy>=1.13.0",
+    "ruff>=0.8.3",
 ]
